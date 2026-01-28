@@ -1,5 +1,5 @@
-// Cording_Samples<br>
-Cording_Samples is directory which shows my-skills and learning-history.<br>
+// Coding_Samples<br>
+Coding_Samples is directory which shows my-skills and learning-history.<br>
 If you are recruiter, check this directory.<br>
 Sometime you want image its working, then also check Image directory.
 
