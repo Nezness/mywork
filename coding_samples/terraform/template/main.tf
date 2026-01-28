@@ -10,8 +10,8 @@ terraform {
     }
   }
   backend "s3" {
-    bucket  = "basevpc-tfstate-bucket-nezness"
-    key     = "basevpc-dev.tfstate"
+    bucket  = "Put your bucket name" # Notioce
+    key     = "${var.project}-{var.environment}.tfstate"
     region  = "ap-northeast-1"
     profile = "terraform"
   }
@@ -44,4 +44,5 @@ variable "environment" {
 
 variable "domain" {
   type = string
+
 }
