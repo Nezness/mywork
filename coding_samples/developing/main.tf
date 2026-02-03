@@ -10,13 +10,7 @@ terraform {
   }
 }
 
-#-------------------------
-# Provider
-#-------------------------
-provider "aws" {
-  profile = "terraform_pub"
-  region  = "ap-northeast-1"
-}
+// provider is on profile.tf(hidden)
 
 #-------------------------
 # Variables
