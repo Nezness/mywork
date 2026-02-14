@@ -7,7 +7,7 @@ resource "aws_apigatewayv2_api" "receipt_api" {
 
   cors_configuration {
     allow_origins = ["*"]
-    allow_methods = ["GET", "POST", "PUT", "OPTIONS"]
+    allow_methods = ["GET", "POST", "PUT", "OPTIONS", "DELETE"]
     allow_headers = ["Content-Type", "Authorization"]
   }
 }
@@ -41,7 +41,35 @@ output "api_endpoint" {
 }
 
 resource "aws_apigatewayv2_route" "upload_route" {
-  api_id = aws_apigatewayv2_api.receipt_api.id
+  api_id    = aws_apigatewayv2_api.receipt_api.id
   route_key = "GET /upload-url"
-  target = "integrations/${aws_apigatewayv2_integration.upload_integration.id}"
+  target    = "integrations/${aws_apigatewayv2_integration.upload_integration.id}"
+}
+
+## Return result to USER
+# Connect Lambda to API Gateway
+resource "aws_apigatewayv2_integration" "get_dynamodb_integration" {
+  api_id                 = aws_apigatewayv2_api.receipt_api.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.get_dynamodb.invoke_arn
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "get_dynamodb_route" {
+  api_id    = aws_apigatewayv2_api.receipt_api.id
+  route_key = "GET /receipts"
+  target    = "integrations/${aws_apigatewayv2_integration.get_dynamodb_integration.id}"
+}
+
+resource "aws_apigatewayv2_integration" "update_integration" {
+  api_id                 = aws_apigatewayv2_api.receipt_api.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.update_receipt.invoke_arn
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "update_route" {
+  api_id    = aws_apigatewayv2_api.receipt_api.id
+  route_key = "PUT /receipts"
+  target    = "integrations/${aws_apigatewayv2_integration.update_integration.id}"
 }

@@ -130,3 +130,24 @@ output "dynamodb_user_budgets_table_arn" {
   value       = aws_dynamodb_table.user_budgets.arn
   description = "ARN of UserBudgets table"
 }
+
+resource "aws_dynamodb_table" "okan_usage" {
+  name         = "OkanUsage"
+  billing_mode = "PAY_PER_REQUEST" # オンデマンドキャパシティ
+  hash_key     = "user_id"
+  range_key    = "usage_date"
+
+  attribute {
+    name = "user_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "usage_date"
+    type = "S"
+  }
+
+  tags = {
+    Name = "OkanUsage"
+  }
+}
