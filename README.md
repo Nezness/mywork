@@ -29,7 +29,7 @@
 - AWS SAA
 
 ## Overview(EN)
-This repository is a portfolio of projects and implementations I have developed while working toward becoming an Infrastructure Engineer.
+This repository is a portfolio of projects and implementations I have developed while working toward becoming an Cloud Engineer.
 
 ## Directory Descriptions
 coding_samples/ Source code for scripts and configuration files (e.g., Terraform) // Contains my learning materials and created assets.
