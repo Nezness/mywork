@@ -17,8 +17,8 @@
 ## 学んだこと
 - Infrastructure as Code（Terraform 等）での環境記述と state 管理の基礎
 - CI/CD（GitHub Actions 等）による自動化パイプラインの構築経験
-- 監視・ロギング（Prometheus / Grafana 等）の基礎理解
 - セキュリティ観点（最小権限、ネットワーク分離）の設計思考
+- iOSアプリのend-to-endフルスタック開発
 
 ## 連絡先
 - GitHub: https://github.com/Nezness  
@@ -40,7 +40,6 @@ Chemical Plant/ Projects related to my university major (Fluid and Thermal Engin
 ## Learnings & Skills
 ･Basics of environment provisioning and state management using Infrastructure as Code (Terraform, etc.)
 ･Experience building automation pipelines via CI/CD (GitHub Actions, etc.)
-･Foundational understanding of monitoring and logging (Prometheus / Grafana, etc.)
 ･Design thinking focused on security (least privilege, network isolation)
 
 ## Contact
