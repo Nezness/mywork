@@ -1,16 +1,16 @@
 resource "random_string" "s3_unique_key" {
-  length  = 6
-  upper   = false
+  length  = 10
+  upper   = true
   lower   = true
   numeric = true
-  special = false
+  special = true
 }
 
 #-------------------------
 # S3 simple bucket
 #-------------------------
 resource "aws_s3_bucket" "s3_static_bucket" {
-  bucket = "${var.project}-${var.environment}-static-bucket-${random_string.s3_unique_key.result}"
+  bucket = "${var.project}-${var.environment}-""-bucket-${random_string.s3_unique_key.result}"
 }
 
 resource "aws_s3_bucket_versioning" "s3_static_bucket" {
