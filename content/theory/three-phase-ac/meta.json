@@ -1,0 +1,131 @@
+{
+  "$schema": "../../schema/meta.schema.json",
+  "schema_version": 1,
+  "id": "three-phase-ac",
+  "title": "三相交流",
+  "title_en": "Three-Phase AC",
+  "layer": "subject_knowledge",
+  "subject": "theory",
+  "exam_scope": {
+    "class2": "core",
+    "class1": "core"
+  },
+  "prerequisites": [
+    "complex-numbers",
+    "phasor-representation",
+    "complex-impedance",
+    "single-phase-ac-power"
+  ],
+  "leads_to": [
+    "symmetrical-components",
+    "per-unit-system",
+    "rotating-magnetic-field",
+    "induction-machine",
+    "synchronous-machine",
+    "three-phase-transformer"
+  ],
+  "related": [
+    "laplace-transform"
+  ],
+  "learning_objectives": [
+    "三相交流が単相に対して持つ利点(回転磁界・送電経済性・瞬時電力一定)を物理と数式の両面で説明できる",
+    "Y 結線・Δ 結線における線間量/相量の関係を導出でき、平衡条件下で相互変換できる",
+    "平衡三相回路を 1 相分等価に帰着させ、複素インピーダンスで解析できる",
+    "瞬時電力が平衡時に時間的に一定となることを式変形で示せる",
+    "不平衡が生じた場合に対称座標法が必要になる動機を説明し、後続トピックへ接続できる"
+  ],
+  "tags": [
+    "three-phase",
+    "ac",
+    "power-systems",
+    "class2-core",
+    "class1-foundation",
+    "prerequisite-for-machines",
+    "prerequisite-for-power"
+  ],
+  "estimated_minutes": 180,
+  "difficulty": 3,
+  "status": "draft",
+  "authors": [],
+  "last_updated": "2026-04-21",
+  "sections": [
+    {
+      "order": 0,
+      "file": "00-prerequisites-review.md",
+      "title": "前提の復習(フェーザ・複素インピーダンス・単相電力)",
+      "objectives": [
+        "本編で頻用する記法と結果を最小限に再確認する"
+      ]
+    },
+    {
+      "order": 1,
+      "file": "01-why-three-phase.md",
+      "title": "なぜ三相か",
+      "objectives": [
+        "回転磁界の生成と送電経済性という二軸で三相の動機を理解する"
+      ]
+    },
+    {
+      "order": 2,
+      "file": "02-three-phase-emf.md",
+      "title": "三相起電力の発生",
+      "objectives": [
+        "120° 位相差の起電力が発電機構造から自然に現れることを理解する",
+        "フェーザ表示と瞬時値表示を相互変換できる"
+      ]
+    },
+    {
+      "order": 3,
+      "file": "03-connections.md",
+      "title": "Y 結線と Δ 結線、線間/相量の関係",
+      "objectives": [
+        "両結線の電圧・電流の √3 関係と 30° 位相差を導出する",
+        "Y ↔ Δ 変換(インピーダンス)を使える"
+      ]
+    },
+    {
+      "order": 4,
+      "file": "04-three-phase-power.md",
+      "title": "三相電力と瞬時電力一定の証明",
+      "objectives": [
+        "有効電力・無効電力・皮相電力の三相式を導く",
+        "平衡時に瞬時電力が時間に依らず一定となることを証明する"
+      ]
+    },
+    {
+      "order": 5,
+      "file": "05-balanced-circuits.md",
+      "title": "平衡三相回路の解法(1 相分等価)",
+      "objectives": [
+        "中性点を仮想接地して 1 相分等価回路に帰着させる",
+        "代表問題を複素計算で解く"
+      ]
+    },
+    {
+      "order": 6,
+      "file": "06-toward-unbalanced.md",
+      "title": "不平衡への入口 — 対称座標法の予告",
+      "objectives": [
+        "不平衡が生じる実務事例を把握する",
+        "対称座標法が必要となる数学的動機を理解する"
+      ],
+      "class1_deep_dive": true
+    },
+    {
+      "order": 7,
+      "file": "07-practice-problems.md",
+      "title": "確認問題(二種一次理論レベル)",
+      "objectives": [
+        "2〜3 問を通して本トピックの運用力を確認する"
+      ]
+    },
+    {
+      "order": 8,
+      "file": "08-summary-and-next.md",
+      "title": "まとめと次の接続",
+      "objectives": [
+        "機械・電力科目への橋渡しを俯瞰する"
+      ]
+    }
+  ]
+}

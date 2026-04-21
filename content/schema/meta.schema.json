@@ -1,0 +1,131 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://denken-app.local/schemas/topic-meta.schema.json",
+  "title": "Topic Meta",
+  "description": "電験学習コンテンツ 1 トピック分のメタデータ。Web/iOS 共有パーサが読む単一ソース。",
+  "type": "object",
+  "required": ["schema_version", "id", "title", "layer", "subject", "sections"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "スキーマ自体のバージョン。破壊的変更時にインクリメント。"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "トピックの安定識別子(kebab-case)。ディレクトリ名や DAG エッジで参照されるため原則不変。"
+    },
+    "title": {
+      "type": "string",
+      "description": "人間可読のトピック名(日本語可)。"
+    },
+    "title_en": {
+      "type": "string",
+      "description": "英語タイトル(任意、将来の国際化・検索補助用)。"
+    },
+    "layer": {
+      "type": "string",
+      "enum": ["basic_concept", "subject_knowledge", "applied_description"],
+      "description": "3 層コンテンツ階層上の所属。"
+    },
+    "subject": {
+      "type": "string",
+      "enum": ["theory", "power", "machine", "law", "cross_cutting"],
+      "description": "科目帰属。基礎概念層は原則 cross_cutting。"
+    },
+    "exam_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "二種/一種それぞれでの扱い。core=必須級、advanced=一種で深掘り、supporting=補助、out_of_scope=範囲外。",
+      "properties": {
+        "class2": { "enum": ["core", "supporting", "out_of_scope"] },
+        "class1": { "enum": ["core", "advanced", "supporting", "out_of_scope"] }
+      }
+    },
+    "prerequisites": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+      "uniqueItems": true,
+      "description": "前提トピック ID。DAG の入エッジを形成する。"
+    },
+    "leads_to": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+      "uniqueItems": true,
+      "description": "推奨される次トピック(情報用)。DAG 整合性は prerequisites 側で担保する。"
+    },
+    "related": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+      "uniqueItems": true,
+      "description": "前提ではないが関連するトピック(参照リンク)。"
+    },
+    "learning_objectives": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1,
+      "description": "このトピック完了時の到達目標。"
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true,
+      "description": "自由タグ。一種深掘り項目は 'class1-deep' 等を付与。"
+    },
+    "estimated_minutes": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "全セクション通読の想定所要時間(分)。"
+    },
+    "difficulty": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5,
+      "description": "主観的難度 1–5。"
+    },
+    "sections": {
+      "type": "array",
+      "minItems": 1,
+      "description": "並び順を持つ節リスト。file は meta.json と同一ディレクトリからの相対パス。",
+      "items": {
+        "type": "object",
+        "required": ["order", "file", "title"],
+        "additionalProperties": false,
+        "properties": {
+          "order": { "type": "integer", "minimum": 0 },
+          "file": {
+            "type": "string",
+            "pattern": "^[0-9]{2}-[a-z0-9-]+\\.md$",
+            "description": "例: 03-connections.md"
+          },
+          "title": { "type": "string" },
+          "objectives": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "class1_deep_dive": {
+            "type": "boolean",
+            "default": false,
+            "description": "一種で特に深掘りされる節。UI で印を付ける。"
+          }
+        }
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": ["draft", "review", "published"],
+      "default": "draft"
+    },
+    "authors": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "last_updated": {
+      "type": "string",
+      "format": "date",
+      "description": "YYYY-MM-DD。"
+    }
+  }
+}
