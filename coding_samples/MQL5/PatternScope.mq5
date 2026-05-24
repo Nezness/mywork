@@ -39,10 +39,17 @@ input int    InpPivotRight       = 5;        // Bars right of pivot
 input int    InpScanBars         = 800;      // Bars to scan
 input int    InpMaxPivots        = 60;       // Max swing points kept
 
-input group "=== Tolerance ==="
+input group "=== Tolerance / Filters ==="
 input double InpEqualTolPct      = 0.20;     // Equal-price tolerance (%)
+input double InpEqualTolATR      = 0.50;     // Equal-price tolerance (xATR)
 input double InpSlopeFlatPct     = 0.05;     // Slope considered flat (%/bar)
 input int    InpMinPatternBars   = 8;        // Minimum pattern width (bars)
+input int    InpATRPeriod        = 14;       // ATR period for volatility scaling
+input double InpMinPatternATR    = 1.5;      // Min pattern depth/height (xATR)
+input double InpPoleMinATR       = 2.0;      // Flag/Pennant pole minimum (xATR)
+input int    InpMinTouches       = 3;        // Triangle/Rectangle min touches per line
+input bool   InpRequireBreak     = false;    // Require neckline break for reversals
+input bool   InpRequireTrend     = true;     // Require prior trend for candlesticks
 
 input group "=== Reversal Patterns ==="
 input bool   InpDoubleTop        = true;
@@ -87,6 +94,10 @@ input bool   InpTweezer          = true;
 input bool   InpPiercing         = true;
 input bool   InpDarkCloud        = true;
 
+input group "=== Confidence Score ==="
+input bool   InpShowScore        = true;     // show 0-100 score in label
+input int    InpMinScore         = 60;       // minimum score to draw / alert (0-100)
+
 input group "=== Visual ==="
 input color  InpBullColor        = clrDodgerBlue;
 input color  InpBearColor        = clrCrimson;
@@ -121,10 +132,14 @@ input string InpAlertSoundFile   = "alert.wav";
 //==================================================================
 #define PS_PREFIX  "PSC_"
 #define PS_DASH    "PSD_"
-#define MAX_PATTERNS 32
+#define MAX_PATTERNS  40
+#define MAX_ALERTS    40
+#define MAX_ATR_CACHE 12
 
 // Pattern catalog — internal English IDs (used as map keys).
 // Display text is resolved at render time via LocalizedPatternName().
+// IMPORTANT: every ID a detector passes to EmphasizeBox() must appear
+// here, otherwise the dashboard row for it is missing.
 const string g_patternNames[] = {
    "Double Top","Double Bottom","Triple Top","Triple Bottom",
    "Head&Shoulders","Inverse H&S","Rounding Top","Rounding Bottom",
@@ -134,7 +149,10 @@ const string g_patternNames[] = {
    "Rectangle","Asc Triangle","Desc Triangle","Sym Triangle",
    "Rising Wedge","Falling Wedge","Cup&Handle","Inv Cup&Handle",
    "Engulfing","Hammer","Shooting Star","Doji",
-   "Morning Star","Evening Star"
+   "Morning Star","Evening Star",
+   "Three Soldiers","Three Crows",
+   "Tweezer Top","Tweezer Bottom",
+   "Piercing Line","Dark Cloud Cover"
 };
 
 //==================================================================
@@ -196,6 +214,167 @@ string DirectionLabel(bool bullish)
   }
 
 //==================================================================
+// VOLATILITY (ATR) — cached per timeframe
+//==================================================================
+double FetchATR(string symbol, ENUM_TIMEFRAMES tf, int shift=1)
+  {
+   ENUM_TIMEFRAMES realTF = (tf == PERIOD_CURRENT) ? _Period : tf;
+   int h = INVALID_HANDLE;
+   for(int i=0;i<g_atrCount;i++)
+      if(g_atrTF[i] == realTF) { h = g_atrHandle[i]; break; }
+   if(h == INVALID_HANDLE)
+     {
+      h = iATR(symbol, realTF, InpATRPeriod);
+      if(h == INVALID_HANDLE) return 0.0;
+      if(g_atrCount < MAX_ATR_CACHE)
+        {
+         g_atrTF[g_atrCount]     = realTF;
+         g_atrHandle[g_atrCount] = h;
+         g_atrCount++;
+        }
+     }
+   double buf[];
+   if(CopyBuffer(h, 0, shift, 1, buf) <= 0) return 0.0;
+   return buf[0];
+  }
+
+//==================================================================
+// SAFE DATETIME MIN / MAX (MathMin/Max overloads on datetime
+// silently promote to double on some MQL5 builds → precision loss)
+//==================================================================
+datetime DTMin(datetime a, datetime b) { return (a < b) ? a : b; }
+datetime DTMax(datetime a, datetime b) { return (a > b) ? a : b; }
+
+//==================================================================
+// EQUALITY — combines % and ATR tolerance for robustness across
+// low-vol and high-vol instruments
+//==================================================================
+bool EqualishATR(double a, double b)
+  {
+   double base = (MathAbs(a)+MathAbs(b))*0.5;
+   if(base <= 0.0) return false;
+   double pctDiff = MathAbs(a-b)/base*100.0;
+   if(pctDiff <= InpEqualTolPct) return true;
+   if(g_curATR > 0.0 && MathAbs(a-b) <= InpEqualTolATR * g_curATR) return true;
+   return false;
+  }
+
+//==================================================================
+// PRIOR TREND CONTEXT (for candlestick patterns)
+//   +1 = uptrend, -1 = downtrend, 0 = ranging
+//==================================================================
+int PriorTrend(const MqlRates &rates[], int idx, int lookback=20)
+  {
+   if(idx - lookback < 0) return 0;
+   double prev = rates[idx-lookback].close;
+   double now  = rates[idx].close;
+   double diff = now - prev;
+   if(g_curATR > 0.0)
+     {
+      if(diff >  0.8 * g_curATR) return  1;
+      if(diff < -0.8 * g_curATR) return -1;
+      return 0;
+     }
+   if(prev <= 0) return 0;
+   double pct = diff / prev * 100.0;
+   if(pct >  0.3) return  1;
+   if(pct < -0.3) return -1;
+   return 0;
+  }
+
+//==================================================================
+// LINE-TOUCH COUNTER — counts pivots within ATR tolerance of the
+// line defined by two anchor points (idx1,price1) → (idx2,price2)
+//==================================================================
+int CountTouches(const Pivot &pv[], int idx1, double p1, int idx2, double p2,
+                 bool useHighs)
+  {
+   int span = idx2 - idx1;
+   if(span == 0) return 0;
+   double slope = (p2 - p1) / (double)span;
+   double tol   = (g_curATR > 0.0)
+                  ? 0.5 * g_curATR
+                  : MathMax(p1, p2) * InpEqualTolPct / 100.0;
+   int count = 0;
+   int n = ArraySize(pv);
+   for(int i=0;i<n;i++)
+     {
+      if(pv[i].isHigh != useHighs) continue;
+      double expected = p1 + slope * (double)(pv[i].idx - idx1);
+      if(MathAbs(pv[i].price - expected) <= tol) count++;
+     }
+   return count;
+  }
+
+//==================================================================
+// PER-PATTERN ALERT COOLDOWN
+//==================================================================
+bool ShouldAlert(string key, int cooldownSec=60)
+  {
+   datetime now = TimeCurrent();
+   for(int i=0;i<g_alertCount;i++)
+     {
+      if(g_alertNames[i] == key)
+        {
+         if(now - g_alertTimes[i] < cooldownSec) return false;
+         g_alertTimes[i] = now;
+         return true;
+        }
+     }
+   if(g_alertCount < MAX_ALERTS)
+     {
+      g_alertNames[g_alertCount] = key;
+      g_alertTimes[g_alertCount] = now;
+      g_alertCount++;
+     }
+   return true;
+  }
+
+//==================================================================
+// TREND-BREAK CONFIRMATION — used by reversal patterns when
+// InpRequireBreak is on. For a bearish reversal, last close must
+// be below neckline; for a bullish reversal, above.
+//==================================================================
+bool BreakConfirmed(const MqlRates &rates[], double neckline, bool bullish)
+  {
+   if(!InpRequireBreak) return true;
+   int n = ArraySize(rates);
+   if(n < 2) return true;
+   double c = rates[n-1].close;
+   return bullish ? (c > neckline) : (c < neckline);
+  }
+
+//==================================================================
+// CONFIDENCE SCORE — 0-100 combining four normalized components.
+//   trendAlign: +1 trend matches expected, 0 neutral, -1 against
+//   tolDiffPct: relative difference (%) of "equal" anchor points (smaller = better)
+//   depthATR:   pattern depth/height in ATR multiples (larger = better)
+//   touches:    line touches for triangle/rectangle/wedge (0 if N/A)
+//   breakConf:  true if InpRequireBreak satisfied (gives 5pt bonus)
+//==================================================================
+int ComputeScore(int trendAlign, double tolDiffPct, double depthATR,
+                 int touches=0, bool breakConf=false)
+  {
+   int trendPts = (trendAlign > 0) ? 30 : ((trendAlign == 0) ? 15 : 0);
+   int tolPts   = (int)MathMax(0.0, 30.0 - MathMin(30.0, tolDiffPct * 60.0));
+   int atrPts   = (int)MathMin(30.0, MathMax(0.0, depthATR * 10.0));
+   int touchPts = (int)MathMin(10.0, MathMax(0.0, (touches-2)*3.5));
+   int bonus    = breakConf ? 5 : 0;
+   int total    = trendPts + tolPts + atrPts + touchPts + bonus;
+   if(total > 100) total = 100;
+   if(total < 0)   total = 0;
+   return total;
+  }
+
+// Convenience: relative diff (%) of two prices, used as tolDiffPct input
+double RelDiffPct(double a, double b)
+  {
+   double base = (MathAbs(a)+MathAbs(b))*0.5;
+   if(base <= 0) return 100.0;
+   return MathAbs(a-b)/base*100.0;
+  }
+
+//==================================================================
 // STRUCTURES
 //==================================================================
 struct Pivot
@@ -216,6 +395,7 @@ struct PatternRecord
    color    clr;
    bool     bullish;
    int      tfMinutes;  // 0 = current chart
+   int      score;      // confidence 0-100
   };
 
 // Dashboard scan result per TF
@@ -224,6 +404,7 @@ struct TFStatus
    ENUM_TIMEFRAMES tf;
    bool   active[MAX_PATTERNS];
    bool   bullish[MAX_PATTERNS];
+   int    score[MAX_PATTERNS];
   };
 
 //==================================================================
@@ -235,8 +416,21 @@ int           g_recordCount = 0;
 datetime      g_lastBarTime = 0;
 TFStatus      g_tfStatus[5];
 int           g_tfCount = 0;
-string        g_lastAlertTag = "";
-datetime      g_lastAlertTime = 0;
+
+// Per-pattern alert cooldown
+string        g_alertNames[MAX_ALERTS];
+datetime      g_alertTimes[MAX_ALERTS];
+int           g_alertCount = 0;
+
+// ATR handle cache (per timeframe)
+ENUM_TIMEFRAMES g_atrTF[MAX_ATR_CACHE];
+int             g_atrHandle[MAX_ATR_CACHE];
+int             g_atrCount = 0;
+
+// Per-scan context (set at start of ScanTimeframe)
+double          g_curATR = 0.0;
+ENUM_TIMEFRAMES g_curTF  = PERIOD_CURRENT;
+string          g_curSym = "";
 
 //==================================================================
 // INIT / DEINIT
@@ -273,6 +467,7 @@ void ConfigureTFList()
         {
          g_tfStatus[g_tfCount].active[j]  = false;
          g_tfStatus[g_tfCount].bullish[j] = false;
+         g_tfStatus[g_tfCount].score[j]   = 0;
         }
       g_tfCount++;
      }
@@ -332,6 +527,11 @@ void ScanTimeframe(string symbol, ENUM_TIMEFRAMES tf, bool draw, int tfSlot=-1)
    MqlRates rates[];
    if(CopyRates(symbol, tf, 0, bars, rates) <= 0) return;
 
+   // Per-scan context for tolerance / trend helpers
+   g_curSym = symbol;
+   g_curTF  = tf;
+   g_curATR = FetchATR(symbol, tf, 1);
+
    // Detect pivots from this rate array
    Pivot pivots[];
    DetectPivots(rates, pivots);
@@ -341,8 +541,9 @@ void ScanTimeframe(string symbol, ENUM_TIMEFRAMES tf, bool draw, int tfSlot=-1)
    if(tfSlot >= 0)
       for(int p=0;p<MAX_PATTERNS;p++)
         {
-         g_tfStatus[tfSlot].active[p] = false;
+         g_tfStatus[tfSlot].active[p]  = false;
          g_tfStatus[tfSlot].bullish[p] = false;
+         g_tfStatus[tfSlot].score[p]   = 0;
         }
 
    // Run pattern detectors
@@ -402,6 +603,17 @@ void DetectPivots(const MqlRates &rates[], Pivot &out[])
          if(rates[i+k].high >= h) isHigh = false;
          if(rates[i+k].low  <= l) isLow  = false;
         }
+      // If both flags survive (very tight range with strict ≤/≥),
+      // prefer the side with the larger range vs neighbors. Splitting
+      // the bar into both a high and a low pivot at the same idx would
+      // corrupt every "next high/low after i" scan downstream.
+      if(isHigh && isLow)
+        {
+         double rangeH = h - rates[i-1].low;
+         double rangeL = rates[i-1].high - l;
+         if(rangeH >= rangeL) isLow = false;
+         else                 isHigh = false;
+        }
       if(isHigh)
         {
          Pivot p;
@@ -409,7 +621,7 @@ void DetectPivots(const MqlRates &rates[], Pivot &out[])
          p.price = h; p.isHigh = true;
          AppendPivot(out, p);
         }
-      if(isLow)
+      else if(isLow)
         {
          Pivot p;
          p.idx = i; p.time = rates[i].time;
@@ -441,11 +653,11 @@ void AppendPivot(Pivot &arr[], Pivot &p)
 //==================================================================
 // UTILITY HELPERS
 //==================================================================
+// Equality check that combines % tolerance with ATR tolerance.
+// All detectors call this rather than raw == — see EqualishATR().
 bool Equalish(double a, double b)
   {
-   double base = (MathAbs(a)+MathAbs(b))*0.5;
-   if(base <= 0.0) return false;
-   return (MathAbs(a-b)/base * 100.0) <= InpEqualTolPct;
+   return EqualishATR(a, b);
   }
 
 double Slope(double y1, double y2, int barsBetween)
@@ -500,7 +712,7 @@ double LineSlope(const Pivot &pv[], int from, int to, bool useHighs)
 // PATTERN RECORD + DRAWING
 //==================================================================
 void Register(string name, datetime t1, datetime t2, double p1, double p2,
-              color clr, bool bullish, int tfSlot)
+              color clr, bool bullish, int tfSlot, int score)
   {
    if(tfSlot >= 0)
      {
@@ -509,13 +721,16 @@ void Register(string name, datetime t1, datetime t2, double p1, double p2,
         {
          g_tfStatus[tfSlot].active[idx]  = true;
          g_tfStatus[tfSlot].bullish[idx] = bullish;
+         // Keep the best score per (TF, pattern) when multiple fire
+         if(score > g_tfStatus[tfSlot].score[idx])
+            g_tfStatus[tfSlot].score[idx] = score;
         }
       return; // MTF-only registration; no drawing
      }
    PatternRecord rec;
    rec.name = name; rec.t1 = t1; rec.t2 = t2;
    rec.p1 = p1; rec.p2 = p2; rec.clr = clr; rec.bullish = bullish;
-   rec.tfMinutes = 0;
+   rec.tfMinutes = 0; rec.score = score;
    int sz = ArraySize(g_records);
    ArrayResize(g_records, sz+1);
    g_records[sz] = rec;
@@ -595,17 +810,22 @@ void DrawArrow(string tag, datetime t, double price, bool up, color clr)
 
 // Generic helper that draws box + label + (optional) lines for a pattern.
 // `name` is the internal English ID; UI strings are localized inside.
+// `score` (0-100) gates registration via InpMinScore and is appended to
+// the chart label when InpShowScore is on.
 void EmphasizeBox(string name, datetime t1, datetime t2, double pHigh, double pLow,
-                  color clr, bool bullish, int tfSlot)
+                  color clr, bool bullish, int tfSlot, int score=70)
   {
-   Register(name,t1,t2,pHigh,pLow,clr,bullish,tfSlot);
+   if(score < InpMinScore) return;
+   Register(name,t1,t2,pHigh,pLow,clr,bullish,tfSlot,score);
    if(tfSlot >= 0) return;
    string tag = name + "_" + (string)t1;
    StringReplace(tag," ","_");
    StringReplace(tag,"&","_");
+   string labelText = LocalizedPatternName(name);
+   if(InpShowScore) labelText = labelText + " (" + (string)score + ")";
    DrawBox(tag,t1,pHigh,t2,pLow,clr);
-   DrawLabel(tag+"_lbl", t2, pHigh, LocalizedPatternName(name), clr, true);
-   FireAlert(name,bullish);
+   DrawLabel(tag+"_lbl", t2, pHigh, labelText, clr, true);
+   FireAlert(name,bullish,score);
   }
 
 //==================================================================
@@ -619,32 +839,40 @@ void DetectDoubleTop(const MqlRates &rates[], const Pivot &pv[], bool draw, int 
    for(int i=n-1;i>=2;i--)
      {
       if(!pv[i].isHigh) continue;
-      // find previous high
       int prevH = -1;
       for(int j=i-1;j>=0;j--) if(pv[j].isHigh){ prevH=j; break; }
       if(prevH<0) continue;
-      // valley between them
       int valley = -1;
       for(int j=prevH+1;j<i;j++) if(!pv[j].isHigh){ valley=j; break; }
       if(valley<0) continue;
       if(!Equalish(pv[i].price, pv[prevH].price)) continue;
-      // valley must be meaningfully below
+
       double depth = pv[i].price - pv[valley].price;
       double base  = pv[i].price;
+      // Require meaningful depth: %-of-price AND multiple-of-ATR
       if(depth/base*100.0 < 0.30) continue;
+      if(g_curATR > 0 && depth < InpMinPatternATR * g_curATR) continue;
       int span = pv[i].idx - pv[prevH].idx;
       if(span < InpMinPatternBars) continue;
 
+      // Optional neckline break confirmation (close below valley)
+      if(!BreakConfirmed(rates, pv[valley].price, false)) continue;
+
+      int trend = PriorTrend(rates, pv[prevH].idx, 30);
+      int score = ComputeScore(trend > 0 ? 1 : (trend == 0 ? 0 : -1),
+                               RelDiffPct(pv[i].price, pv[prevH].price),
+                               (g_curATR > 0) ? depth/g_curATR : 1.0,
+                               0, InpRequireBreak);
       EmphasizeBox("Double Top", pv[prevH].time, pv[i].time,
                    MathMax(pv[i].price,pv[prevH].price), pv[valley].price,
-                   InpBearColor, false, tfSlot);
+                   InpBearColor, false, tfSlot, score);
       if(tfSlot<0)
         {
          string tag = "DT_neck_"+(string)pv[i].time;
          DrawTrend(tag, pv[valley].time, pv[valley].price,
                    pv[i].time, pv[valley].price, InpBearColor, STYLE_DASH, true);
         }
-      return; // only most-recent
+      return;
      }
   }
 
@@ -661,15 +889,25 @@ void DetectDoubleBottom(const MqlRates &rates[], const Pivot &pv[], bool draw, i
       for(int j=prevL+1;j<i;j++) if(pv[j].isHigh){ peak=j; break; }
       if(peak<0) continue;
       if(!Equalish(pv[i].price, pv[prevL].price)) continue;
+
       double height = pv[peak].price - pv[i].price;
       double base = pv[i].price;
       if(height/base*100.0 < 0.30) continue;
+      if(g_curATR > 0 && height < InpMinPatternATR * g_curATR) continue;
       int span = pv[i].idx - pv[prevL].idx;
       if(span < InpMinPatternBars) continue;
 
+      // Optional neckline break confirmation (close above peak)
+      if(!BreakConfirmed(rates, pv[peak].price, true)) continue;
+
+      int trend = PriorTrend(rates, pv[prevL].idx, 30);
+      int score = ComputeScore(trend < 0 ? 1 : (trend == 0 ? 0 : -1),
+                               RelDiffPct(pv[i].price, pv[prevL].price),
+                               (g_curATR > 0) ? height/g_curATR : 1.0,
+                               0, InpRequireBreak);
       EmphasizeBox("Double Bottom", pv[prevL].time, pv[i].time,
                    pv[peak].price, MathMin(pv[i].price,pv[prevL].price),
-                   InpBullColor, true, tfSlot);
+                   InpBullColor, true, tfSlot, score);
       if(tfSlot<0)
         {
          string tag = "DB_neck_"+(string)pv[i].time;
@@ -699,8 +937,23 @@ void DetectTripleTop(const MqlRates &rates[], const Pivot &pv[], bool draw, int 
       if(v1<0||v2<0) continue;
       double neck = MathMin(pv[v1].price,pv[v2].price);
       double top  = MathMax(MathMax(pv[h1].price,pv[h2].price),pv[i].price);
+      double depth = top - neck;
+      // Same depth + span gating as Double Top
+      if(top > 0 && depth/top*100.0 < 0.30) continue;
+      if(g_curATR > 0 && depth < InpMinPatternATR * g_curATR) continue;
+      if(pv[i].idx - pv[h1].idx < InpMinPatternBars) continue;
+      if(!BreakConfirmed(rates, neck, false)) continue;
+
+      int trend = PriorTrend(rates, pv[h1].idx, 30);
+      double avgTolPct = (RelDiffPct(pv[h1].price,pv[h2].price)
+                        + RelDiffPct(pv[h2].price,pv[i].price)) * 0.5;
+      int score = ComputeScore(trend > 0 ? 1 : (trend == 0 ? 0 : -1),
+                               avgTolPct,
+                               (g_curATR > 0) ? depth/g_curATR : 1.0,
+                               0, InpRequireBreak) + 5;  // triple is rarer → bonus
+      if(score > 100) score = 100;
       EmphasizeBox("Triple Top", pv[h1].time, pv[i].time, top, neck,
-                   InpBearColor, false, tfSlot);
+                   InpBearColor, false, tfSlot, score);
       if(tfSlot<0)
         {
          string tag = "TT_neck_"+(string)pv[i].time;
@@ -730,8 +983,22 @@ void DetectTripleBottom(const MqlRates &rates[], const Pivot &pv[], bool draw, i
       if(p1<0||p2<0) continue;
       double neck = MathMax(pv[p1].price,pv[p2].price);
       double bot  = MathMin(MathMin(pv[l1].price,pv[l2].price),pv[i].price);
+      double height = neck - bot;
+      if(neck > 0 && height/neck*100.0 < 0.30) continue;
+      if(g_curATR > 0 && height < InpMinPatternATR * g_curATR) continue;
+      if(pv[i].idx - pv[l1].idx < InpMinPatternBars) continue;
+      if(!BreakConfirmed(rates, neck, true)) continue;
+
+      int trend = PriorTrend(rates, pv[l1].idx, 30);
+      double avgTolPct = (RelDiffPct(pv[l1].price,pv[l2].price)
+                        + RelDiffPct(pv[l2].price,pv[i].price)) * 0.5;
+      int score = ComputeScore(trend < 0 ? 1 : (trend == 0 ? 0 : -1),
+                               avgTolPct,
+                               (g_curATR > 0) ? height/g_curATR : 1.0,
+                               0, InpRequireBreak) + 5;
+      if(score > 100) score = 100;
       EmphasizeBox("Triple Bottom", pv[l1].time, pv[i].time, neck, bot,
-                   InpBullColor, true, tfSlot);
+                   InpBullColor, true, tfSlot, score);
       if(tfSlot<0)
         {
          string tag = "TB_neck_"+(string)pv[i].time;
@@ -756,13 +1023,39 @@ void DetectHeadShoulders(const MqlRates &rates[], const Pivot &pv[], bool draw, 
       if(pv[head].price <= pv[i].price)   continue;
       if(pv[head].price <= pv[left].price) continue;
       if(!Equalish(pv[left].price, pv[i].price)) continue;
+
+      // Head must be meaningfully higher than shoulders (not just barely)
+      double shoulderAvg = (pv[left].price + pv[i].price) * 0.5;
+      double headLift = pv[head].price - shoulderAvg;
+      if(g_curATR > 0 && headLift < 0.5 * g_curATR) continue;
+
+      // Time symmetry: left-span vs right-span within 50% of each other
+      int leftSpan  = pv[head].idx - pv[left].idx;
+      int rightSpan = pv[i].idx    - pv[head].idx;
+      if(leftSpan <= 0 || rightSpan <= 0) continue;
+      double ratio = (double)MathMin(leftSpan,rightSpan)
+                   / (double)MathMax(leftSpan,rightSpan);
+      if(ratio < 0.50) continue;
+
       int v1=-1,v2=-1;
       for(int j=left+1;j<head;j++) if(!pv[j].isHigh){ v1=j; break; }
-      for(int j=head+1;j<i;j++) if(!pv[j].isHigh){ v2=j; break; }
+      for(int j=head+1;j<i;j++)    if(!pv[j].isHigh){ v2=j; break; }
       if(v1<0||v2<0) continue;
       double neck = MathMin(pv[v1].price,pv[v2].price);
+
+      if(!BreakConfirmed(rates, neck, false)) continue;
+
+      int trend = PriorTrend(rates, pv[left].idx, 30);
+      double depth = pv[head].price - neck;
+      int baseScore = ComputeScore(trend > 0 ? 1 : (trend == 0 ? 0 : -1),
+                                   RelDiffPct(pv[left].price, pv[i].price),
+                                   (g_curATR > 0) ? depth/g_curATR : 1.0,
+                                   0, InpRequireBreak);
+      int score = baseScore + (int)(ratio * 10) - 5;  // symmetry bonus
+      if(score < 0)   score = 0;
+      if(score > 100) score = 100;
       EmphasizeBox("Head&Shoulders", pv[left].time, pv[i].time,
-                   pv[head].price, neck, InpBearColor, false, tfSlot);
+                   pv[head].price, neck, InpBearColor, false, tfSlot, score);
       if(tfSlot<0)
         {
          string tag = "HS_neck_"+(string)pv[i].time;
@@ -787,13 +1080,37 @@ void DetectInverseHS(const MqlRates &rates[], const Pivot &pv[], bool draw, int 
       if(pv[head].price >= pv[i].price)   continue;
       if(pv[head].price >= pv[left].price) continue;
       if(!Equalish(pv[left].price, pv[i].price)) continue;
+
+      double shoulderAvg = (pv[left].price + pv[i].price) * 0.5;
+      double headDrop = shoulderAvg - pv[head].price;
+      if(g_curATR > 0 && headDrop < 0.5 * g_curATR) continue;
+
+      int leftSpan  = pv[head].idx - pv[left].idx;
+      int rightSpan = pv[i].idx    - pv[head].idx;
+      if(leftSpan <= 0 || rightSpan <= 0) continue;
+      double ratio = (double)MathMin(leftSpan,rightSpan)
+                   / (double)MathMax(leftSpan,rightSpan);
+      if(ratio < 0.50) continue;
+
       int p1=-1,p2=-1;
       for(int j=left+1;j<head;j++) if(pv[j].isHigh){ p1=j; break; }
-      for(int j=head+1;j<i;j++) if(pv[j].isHigh){ p2=j; break; }
+      for(int j=head+1;j<i;j++)    if(pv[j].isHigh){ p2=j; break; }
       if(p1<0||p2<0) continue;
       double neck = MathMax(pv[p1].price,pv[p2].price);
+
+      if(!BreakConfirmed(rates, neck, true)) continue;
+
+      int trend = PriorTrend(rates, pv[left].idx, 30);
+      double depth = neck - pv[head].price;
+      int baseScore = ComputeScore(trend < 0 ? 1 : (trend == 0 ? 0 : -1),
+                                   RelDiffPct(pv[left].price, pv[i].price),
+                                   (g_curATR > 0) ? depth/g_curATR : 1.0,
+                                   0, InpRequireBreak);
+      int score = baseScore + (int)(ratio * 10) - 5;
+      if(score < 0)   score = 0;
+      if(score > 100) score = 100;
       EmphasizeBox("Inverse H&S", pv[left].time, pv[i].time, neck,
-                   pv[head].price, InpBullColor, true, tfSlot);
+                   pv[head].price, InpBullColor, true, tfSlot, score);
       if(tfSlot<0)
         {
          string tag = "IHS_neck_"+(string)pv[i].time;
@@ -860,7 +1177,9 @@ void DetectRoundingBottom(const MqlRates &rates[], const Pivot &pv[], bool draw,
                 InpBullColor, true, tfSlot);
   }
 
-// --- V-Top / V-Bottom: sharp single pivot with strong opposite moves on each side ---
+// --- V-Top / V-Bottom: sharp single pivot with strong opposite moves on each side.
+//     Threshold is ATR-relative (>= InpMinPatternATR * ATR drop on BOTH sides),
+//     so calm pairs don't trigger and volatile pairs don't drown out the signal.
 void DetectVTop(const MqlRates &rates[], const Pivot &pv[], bool draw, int tfSlot)
   {
    int n = ArraySize(pv);
@@ -871,9 +1190,12 @@ void DetectVTop(const MqlRates &rates[], const Pivot &pv[], bool draw, int tfSlo
       int fwd  = MathMin(pv[i].idx + 8, ArraySize(rates)-1);
       double leftLow  = rates[back].low;
       double rightLow = rates[fwd].low;
-      double drop1 = (pv[i].price - leftLow)/pv[i].price*100.0;
-      double drop2 = (pv[i].price - rightLow)/pv[i].price*100.0;
-      if(drop1 > 1.0 && drop2 > 1.0)
+      double drop1 = pv[i].price - leftLow;
+      double drop2 = pv[i].price - rightLow;
+      double need  = (g_curATR > 0)
+                     ? InpMinPatternATR * g_curATR
+                     : pv[i].price * 0.01;
+      if(drop1 > need && drop2 > need)
         {
          EmphasizeBox("V-Top", rates[back].time, rates[fwd].time,
                       pv[i].price, MathMin(leftLow,rightLow),
@@ -892,9 +1214,12 @@ void DetectVBottom(const MqlRates &rates[], const Pivot &pv[], bool draw, int tf
       int fwd  = MathMin(pv[i].idx + 8, ArraySize(rates)-1);
       double leftHigh  = rates[back].high;
       double rightHigh = rates[fwd].high;
-      double rise1 = (leftHigh  - pv[i].price)/pv[i].price*100.0;
-      double rise2 = (rightHigh - pv[i].price)/pv[i].price*100.0;
-      if(rise1 > 1.0 && rise2 > 1.0)
+      double rise1 = leftHigh  - pv[i].price;
+      double rise2 = rightHigh - pv[i].price;
+      double need  = (g_curATR > 0)
+                     ? InpMinPatternATR * g_curATR
+                     : pv[i].price * 0.01;
+      if(rise1 > need && rise2 > need)
         {
          EmphasizeBox("V-Bottom", rates[back].time, rates[fwd].time,
                       MathMax(leftHigh,rightHigh), pv[i].price,
@@ -904,29 +1229,65 @@ void DetectVBottom(const MqlRates &rates[], const Pivot &pv[], bool draw, int tf
      }
   }
 
-// --- Diamond Top/Bottom: broadening then symmetrical contraction ---
+// --- Diamond: broadening phase followed by symmetrical contraction.
+//     Split last 7 pivots into older half (broadening) and newer half
+//     (contracting). Each half must have ≥2 highs and ≥2 lows whose
+//     sequence respects the expected direction. Trend context selects
+//     Top vs Bottom so the two detectors never double-fire.
+bool DiamondShape(const Pivot &pv[], int a, int b)
+  {
+   int mid = (a + b) / 2;
+   double prevH=-1, prevL=1e18;
+   int hCount=0, lCount=0;
+   bool bHi=true, bLo=true;
+   for(int i=a;i<=mid;i++)
+     {
+      if(pv[i].isHigh)
+        {
+         if(prevH>0 && pv[i].price <= prevH) bHi=false;
+         prevH = pv[i].price; hCount++;
+        }
+      else
+        {
+         if(prevL<1e17 && pv[i].price >= prevL) bLo=false;
+         prevL = pv[i].price; lCount++;
+        }
+     }
+   if(hCount<2 || lCount<2 || !bHi || !bLo) return false;
+
+   prevH=-1; prevL=1e18; hCount=0; lCount=0;
+   bool cHi=true, cLo=true;
+   for(int i=mid+1;i<=b;i++)
+     {
+      if(pv[i].isHigh)
+        {
+         if(prevH>0 && pv[i].price >= prevH) cHi=false;
+         prevH = pv[i].price; hCount++;
+        }
+      else
+        {
+         if(prevL<1e17 && pv[i].price <= prevL) cLo=false;
+         prevL = pv[i].price; lCount++;
+        }
+     }
+   return (hCount>=2 && lCount>=2 && cHi && cLo);
+  }
+
 void DetectDiamondTop(const MqlRates &rates[], const Pivot &pv[], bool draw, int tfSlot)
   {
    int n = ArraySize(pv);
    if(n < 7) return;
-   // Look at last ~7 pivots and check broadening then contracting around a top
    int a=n-7, b=n-1;
-   double hi1=-1,hi2=-1; // first/last high in range
-   double lo1= 1e18, lo2=1e18;
-   for(int i=a;i<=b;i++)
-     {
-      if(pv[i].isHigh){ if(hi1<0) hi1=pv[i].price; hi2=pv[i].price; }
-      else            { if(lo1>1e17) lo1=pv[i].price; lo2=pv[i].price; }
-     }
-   // Middle highs/lows extremes
-   double maxH=-1,minL=1e18;
+   if(!DiamondShape(pv,a,b)) return;
+   // Only register as TOP after preceding uptrend
+   if(InpRequireTrend && PriorTrend(rates, ArraySize(rates)-2, 30) <= 0) return;
+   double maxH=-1, minL=1e18;
    for(int i=a;i<=b;i++)
      {
       if(pv[i].isHigh && pv[i].price>maxH) maxH=pv[i].price;
       if(!pv[i].isHigh && pv[i].price<minL) minL=pv[i].price;
      }
-   if(hi1<0||hi2<0||lo1>1e17||lo2>1e17||maxH<0||minL>1e17) return;
-   if(!(maxH > hi1 && maxH > hi2 && minL < lo1 && minL < lo2)) return;
+   if(maxH<0||minL>1e17) return;
    EmphasizeBox("Diamond Top", pv[a].time, pv[b].time, maxH, minL,
                 InpBearColor, false, tfSlot);
   }
@@ -936,91 +1297,78 @@ void DetectDiamondBottom(const MqlRates &rates[], const Pivot &pv[], bool draw, 
    int n = ArraySize(pv);
    if(n < 7) return;
    int a=n-7, b=n-1;
-   double hi1=-1,hi2=-1, lo1=1e18,lo2=1e18, maxH=-1,minL=1e18;
+   if(!DiamondShape(pv,a,b)) return;
+   if(InpRequireTrend && PriorTrend(rates, ArraySize(rates)-2, 30) >= 0) return;
+   double maxH=-1, minL=1e18;
    for(int i=a;i<=b;i++)
      {
-      if(pv[i].isHigh){ if(hi1<0) hi1=pv[i].price; hi2=pv[i].price; if(pv[i].price>maxH) maxH=pv[i].price; }
-      else            { if(lo1>1e17) lo1=pv[i].price; lo2=pv[i].price; if(pv[i].price<minL) minL=pv[i].price; }
+      if(pv[i].isHigh && pv[i].price>maxH) maxH=pv[i].price;
+      if(!pv[i].isHigh && pv[i].price<minL) minL=pv[i].price;
      }
-   if(hi1<0||lo1>1e17) return;
-   if(!(maxH > hi1 && maxH > hi2 && minL < lo1 && minL < lo2)) return;
+   if(maxH<0||minL>1e17) return;
    EmphasizeBox("Diamond Bottom", pv[a].time, pv[b].time, maxH, minL,
                 InpBullColor, true, tfSlot);
   }
 
-// --- Broadening top/bottom (Megaphone) ---
+// --- Broadening / Megaphone: highs ascending AND lows descending.
+//     Top vs Bottom resolved by preceding trend so the two detectors
+//     are mutually exclusive — they cannot both fire on the same shape.
+bool BroadeningShape(const Pivot &pv[], int a, int b, double &maxH, double &minL)
+  {
+   int hCnt=0, lCnt=0;
+   double prevH=-1, prevL=1e18;
+   bool hAsc=true, lDesc=true;
+   maxH = -1; minL = 1e18;
+   for(int i=a;i<=b;i++)
+     {
+      if(pv[i].isHigh)
+        {
+         if(prevH>0 && pv[i].price <= prevH) hAsc=false;
+         prevH = pv[i].price; hCnt++;
+         if(pv[i].price > maxH) maxH = pv[i].price;
+        }
+      else
+        {
+         if(prevL<1e17 && pv[i].price >= prevL) lDesc=false;
+         prevL = pv[i].price; lCnt++;
+         if(pv[i].price < minL) minL = pv[i].price;
+        }
+     }
+   return (hCnt>=2 && lCnt>=2 && hAsc && lDesc);
+  }
+
 void DetectBroadeningTop(const MqlRates &rates[], const Pivot &pv[], bool draw, int tfSlot)
   {
    int n = ArraySize(pv);
    if(n < 5) return;
-   // need at least 3 highs ascending and 2 lows descending in last window
-   int hCnt=0,lCnt=0;
-   double prevH=-1, prevL=1e18;
-   bool hAsc=true, lDesc=true;
-   for(int i=MathMax(0,n-7);i<n;i++)
-     {
-      if(pv[i].isHigh)
-        {
-         if(prevH>0 && pv[i].price <= prevH) hAsc=false;
-         prevH = pv[i].price; hCnt++;
-        }
-      else
-        {
-         if(prevL<1e17 && pv[i].price >= prevL) lDesc=false;
-         prevL = pv[i].price; lCnt++;
-        }
-     }
-   if(hCnt>=2 && lCnt>=2 && hAsc && lDesc)
-     {
-      int a = MathMax(0,n-7);
-      EmphasizeBox("Broadening Top", pv[a].time, pv[n-1].time,
-                   prevH, prevL, InpBearColor, false, tfSlot);
-     }
+   int a = MathMax(0,n-7);
+   double maxH, minL;
+   if(!BroadeningShape(pv,a,n-1,maxH,minL)) return;
+   // Top only after preceding uptrend
+   if(PriorTrend(rates, ArraySize(rates)-2, 30) <= 0) return;
+   EmphasizeBox("Broadening Top", pv[a].time, pv[n-1].time,
+                maxH, minL, InpBearColor, false, tfSlot);
   }
 
 void DetectBroadeningBottom(const MqlRates &rates[], const Pivot &pv[], bool draw, int tfSlot)
   {
-   // Same as broadening top, distinguishing by trend context is harder; reuse but mark bullish
    int n = ArraySize(pv);
    if(n < 5) return;
-   int hCnt=0,lCnt=0;
-   double prevH=-1, prevL=1e18, maxH=-1, minL=1e18;
-   bool hAsc=true, lDesc=true;
-   for(int i=MathMax(0,n-7);i<n;i++)
-     {
-      if(pv[i].isHigh)
-        {
-         if(prevH>0 && pv[i].price <= prevH) hAsc=false;
-         prevH = pv[i].price; hCnt++;
-         if(pv[i].price>maxH) maxH=pv[i].price;
-        }
-      else
-        {
-         if(prevL<1e17 && pv[i].price >= prevL) lDesc=false;
-         prevL = pv[i].price; lCnt++;
-         if(pv[i].price<minL) minL=pv[i].price;
-        }
-     }
-   if(hCnt>=2 && lCnt>=2 && hAsc && lDesc)
-     {
-      // Context: preceding trend down → broadening bottom
-      int n2 = ArraySize(rates);
-      double before = rates[MathMax(0,n2-60)].close;
-      double now    = rates[n2-1].close;
-      if(now < before)
-        {
-         int a = MathMax(0,n-7);
-         EmphasizeBox("Broadening Bottom", pv[a].time, pv[n-1].time,
-                      maxH, minL, InpBullColor, true, tfSlot);
-        }
-     }
+   int a = MathMax(0,n-7);
+   double maxH, minL;
+   if(!BroadeningShape(pv,a,n-1,maxH,minL)) return;
+   if(PriorTrend(rates, ArraySize(rates)-2, 30) >= 0) return;
+   EmphasizeBox("Broadening Bottom", pv[a].time, pv[n-1].time,
+                maxH, minL, InpBullColor, true, tfSlot);
   }
 
 //==================================================================
 // PATTERN DETECTORS — CONTINUATION
 //==================================================================
 
-// --- Flags: strong pole then parallel channel against trend ---
+// --- Flags: strong pole then parallel channel against trend.
+//     Pole magnitude required as a multiple of ATR rather than a flat %,
+//     so the threshold adapts across timeframes and instruments.
 void DetectBullFlag(const MqlRates &rates[], const Pivot &pv[], bool draw, int tfSlot)
   {
    int n = ArraySize(rates);
@@ -1032,9 +1380,9 @@ void DetectBullFlag(const MqlRates &rates[], const Pivot &pv[], bool draw, int t
    if(poleStart < 0) return;
    double poleLow  = rates[poleStart].low;
    double poleHigh = rates[flagStart].high;
-   double poleGain = (poleHigh - poleLow)/poleLow*100.0;
-   if(poleGain < 1.0) return;
-   // Inside flag, slope of highs and lows should be negative & similar
+   double poleGain = poleHigh - poleLow;
+   double need     = (g_curATR > 0) ? InpPoleMinATR * g_curATR : poleLow*0.01;
+   if(poleGain < need) return;
    double sHi = LinearRegSlope(rates, flagStart, end, true);
    double sLo = LinearRegSlope(rates, flagStart, end, false);
    if(sHi >= 0 || sLo >= 0) return;
@@ -1055,8 +1403,9 @@ void DetectBearFlag(const MqlRates &rates[], const Pivot &pv[], bool draw, int t
    if(poleStart < 0) return;
    double poleHigh = rates[poleStart].high;
    double poleLow  = rates[flagStart].low;
-   double poleDrop = (poleHigh - poleLow)/poleHigh*100.0;
-   if(poleDrop < 1.0) return;
+   double poleDrop = poleHigh - poleLow;
+   double need     = (g_curATR > 0) ? InpPoleMinATR * g_curATR : poleHigh*0.01;
+   if(poleDrop < need) return;
    double sHi = LinearRegSlope(rates, flagStart, end, true);
    double sLo = LinearRegSlope(rates, flagStart, end, false);
    if(sHi <= 0 || sLo <= 0) return;
@@ -1090,8 +1439,9 @@ void DetectBullPennant(const MqlRates &rates[], const Pivot &pv[], bool draw, in
    int pStart = end - pennBars;
    int poleS  = pStart - poleBars;
    if(poleS < 0) return;
-   double poleGain = (rates[pStart].high - rates[poleS].low)/rates[poleS].low*100.0;
-   if(poleGain < 1.0) return;
+   double poleGain = rates[pStart].high - rates[poleS].low;
+   double need     = (g_curATR > 0) ? InpPoleMinATR * g_curATR : rates[poleS].low*0.01;
+   if(poleGain < need) return;
    double sHi = LinearRegSlope(rates, pStart, end, true);
    double sLo = LinearRegSlope(rates, pStart, end, false);
    if(sHi >= 0 || sLo <= 0) return;
@@ -1108,8 +1458,9 @@ void DetectBearPennant(const MqlRates &rates[], const Pivot &pv[], bool draw, in
    int pStart = end - pennBars;
    int poleS  = pStart - poleBars;
    if(poleS < 0) return;
-   double poleDrop = (rates[poleS].high - rates[pStart].low)/rates[poleS].high*100.0;
-   if(poleDrop < 1.0) return;
+   double poleDrop = rates[poleS].high - rates[pStart].low;
+   double need     = (g_curATR > 0) ? InpPoleMinATR * g_curATR : rates[poleS].high*0.01;
+   if(poleDrop < need) return;
    double sHi = LinearRegSlope(rates, pStart, end, true);
    double sLo = LinearRegSlope(rates, pStart, end, false);
    if(sHi >= 0 || sLo <= 0) return;
@@ -1123,7 +1474,6 @@ void DetectRectangle(const MqlRates &rates[], const Pivot &pv[], bool draw, int 
   {
    int n = ArraySize(pv);
    if(n < 4) return;
-   // last 2 highs and 2 lows nearly equal
    int h2=-1,h1=-1,l2=-1,l1=-1;
    for(int i=n-1;i>=0;i--)
      {
@@ -1134,14 +1484,32 @@ void DetectRectangle(const MqlRates &rates[], const Pivot &pv[], bool draw, int 
    if(h1<0||h2<0||l1<0||l2<0) return;
    if(!Equalish(pv[h1].price,pv[h2].price)) return;
    if(!Equalish(pv[l1].price,pv[l2].price)) return;
-   datetime t1 = MathMin(pv[h1].time,pv[l1].time);
-   datetime t2 = MathMax(pv[h2].time,pv[l2].time);
-   // Bullish if recent close near top, bearish if near bottom — neutral here
-   double mid = (pv[h2].price+pv[l2].price)/2.0;
-   bool bullish = rates[ArraySize(rates)-1].close > mid;
+
+   // Rectangle is taken seriously only with multiple touches per rail
+   int hT = CountTouches(pv, pv[h1].idx, pv[h1].price, pv[h2].idx, pv[h2].price, true);
+   int lT = CountTouches(pv, pv[l1].idx, pv[l1].price, pv[l2].idx, pv[l2].price, false);
+   if(MathMin(hT,lT) < 2 || (hT + lT) < InpMinTouches + 1) return;
+
+   double resistance = (pv[h1].price + pv[h2].price) * 0.5;
+   double support    = (pv[l1].price + pv[l2].price) * 0.5;
+   double last = rates[ArraySize(rates)-1].close;
+   // Direction is decided by an actual breakout above resistance or
+   // below support, not by which half of the box price sits in.
+   bool bullish    = last > resistance;
+   bool bearish    = last < support;
+   if(!bullish && !bearish) return;
+
+   datetime t1 = DTMin(pv[h1].time,pv[l1].time);
+   datetime t2 = DTMax(pv[h2].time,pv[l2].time);
+   double height = resistance - support;
+   double avgTolPct = (RelDiffPct(pv[h1].price, pv[h2].price)
+                     + RelDiffPct(pv[l1].price, pv[l2].price)) * 0.5;
+   int score = ComputeScore(0, avgTolPct,
+                            (g_curATR > 0) ? height/g_curATR : 1.0,
+                            hT + lT);
    EmphasizeBox("Rectangle", t1, t2, MathMax(pv[h1].price,pv[h2].price),
                 MathMin(pv[l1].price,pv[l2].price),
-                bullish?InpBullColor:InpBearColor, bullish, tfSlot);
+                bullish?InpBullColor:InpBearColor, bullish, tfSlot, score);
   }
 
 // --- Triangles ---
@@ -1159,11 +1527,23 @@ void DetectAscendingTri(const MqlRates &rates[], const Pivot &pv[], bool draw, i
    if(h1<0||h2<0||l1<0||l2<0) return;
    if(!Equalish(pv[h1].price,pv[h2].price)) return;
    if(pv[l2].price <= pv[l1].price) return;
-   datetime t1 = MathMin(pv[h1].time,pv[l1].time);
-   datetime t2 = MathMax(pv[h2].time,pv[l2].time);
+
+   // Require ≥InpMinTouches touches on at least one line, ≥2 on the other
+   int hT = CountTouches(pv, pv[h1].idx, pv[h1].price, pv[h2].idx, pv[h2].price, true);
+   int lT = CountTouches(pv, pv[l1].idx, pv[l1].price, pv[l2].idx, pv[l2].price, false);
+   if(MathMax(hT,lT) < InpMinTouches || MathMin(hT,lT) < 2) return;
+
+   datetime t1 = DTMin(pv[h1].time,pv[l1].time);
+   datetime t2 = DTMax(pv[h2].time,pv[l2].time);
+   double height = pv[h2].price - pv[l1].price;
+   int trend = PriorTrend(rates, pv[l1].idx, 30);
+   int score = ComputeScore(trend >= 0 ? 1 : -1,
+                            RelDiffPct(pv[h1].price, pv[h2].price),
+                            (g_curATR > 0) ? height/g_curATR : 1.0,
+                            hT + lT);
    EmphasizeBox("Asc Triangle", t1, t2, MathMax(pv[h1].price,pv[h2].price),
                 MathMin(pv[l1].price,pv[l2].price),
-                InpBullColor, true, tfSlot);
+                InpBullColor, true, tfSlot, score);
    if(tfSlot<0)
      {
       string tag = "AT_"+(string)pv[h2].time;
@@ -1188,17 +1568,28 @@ void DetectDescendingTri(const MqlRates &rates[], const Pivot &pv[], bool draw, 
    if(h1<0||h2<0||l1<0||l2<0) return;
    if(!Equalish(pv[l1].price,pv[l2].price)) return;
    if(pv[h2].price >= pv[h1].price) return;
-   datetime t1 = MathMin(pv[h1].time,pv[l1].time);
-   datetime t2 = MathMax(pv[h2].time,pv[l2].time);
+
+   int hT = CountTouches(pv, pv[h1].idx, pv[h1].price, pv[h2].idx, pv[h2].price, true);
+   int lT = CountTouches(pv, pv[l1].idx, pv[l1].price, pv[l2].idx, pv[l2].price, false);
+   if(MathMax(hT,lT) < InpMinTouches || MathMin(hT,lT) < 2) return;
+
+   datetime t1 = DTMin(pv[h1].time,pv[l1].time);
+   datetime t2 = DTMax(pv[h2].time,pv[l2].time);
+   double height = pv[h1].price - pv[l1].price;
+   int trend = PriorTrend(rates, pv[h1].idx, 30);
+   int score = ComputeScore(trend <= 0 ? 1 : -1,
+                            RelDiffPct(pv[l1].price, pv[l2].price),
+                            (g_curATR > 0) ? height/g_curATR : 1.0,
+                            hT + lT);
    EmphasizeBox("Desc Triangle", t1, t2, MathMax(pv[h1].price,pv[h2].price),
                 MathMin(pv[l1].price,pv[l2].price),
-                InpBearColor, false, tfSlot);
+                InpBearColor, false, tfSlot, score);
    if(tfSlot<0)
      {
-      string tag = "DT_"+(string)pv[h2].time;
-      DrawTrend("DTT_top_"+tag, pv[h1].time, pv[h1].price, pv[h2].time, pv[h2].price,
+      string tag = "DSC_"+(string)pv[h2].time;
+      DrawTrend("DSC_top_"+tag, pv[h1].time, pv[h1].price, pv[h2].time, pv[h2].price,
                 InpBearColor, STYLE_SOLID, true);
-      DrawTrend("DTT_bot_"+tag, pv[l1].time, pv[l1].price, pv[l2].time, pv[l2].price,
+      DrawTrend("DSC_bot_"+tag, pv[l1].time, pv[l1].price, pv[l2].time, pv[l2].price,
                 InpBearColor, STYLE_SOLID, true);
      }
   }
@@ -1217,11 +1608,22 @@ void DetectSymmetricalTri(const MqlRates &rates[], const Pivot &pv[], bool draw,
    if(h1<0||h2<0||l1<0||l2<0) return;
    if(pv[h2].price >= pv[h1].price) return;
    if(pv[l2].price <= pv[l1].price) return;
-   datetime t1 = MathMin(pv[h1].time,pv[l1].time);
-   datetime t2 = MathMax(pv[h2].time,pv[l2].time);
+
+   int hT = CountTouches(pv, pv[h1].idx, pv[h1].price, pv[h2].idx, pv[h2].price, true);
+   int lT = CountTouches(pv, pv[l1].idx, pv[l1].price, pv[l2].idx, pv[l2].price, false);
+   if(MathMax(hT,lT) < InpMinTouches || MathMin(hT,lT) < 2) return;
+
+   datetime t1 = DTMin(pv[h1].time,pv[l1].time);
+   datetime t2 = DTMax(pv[h2].time,pv[l2].time);
+   double height = pv[h1].price - pv[l1].price;
+   // Sym triangle is neutral — score uses neutral trend alignment
+   int score = ComputeScore(0,
+                            0.0,  // no equality constraint to fit
+                            (g_curATR > 0) ? height/g_curATR : 1.0,
+                            hT + lT);
    EmphasizeBox("Sym Triangle", t1, t2, MathMax(pv[h1].price,pv[h2].price),
                 MathMin(pv[l1].price,pv[l2].price),
-                InpNeutralColor, true, tfSlot);
+                InpNeutralColor, true, tfSlot, score);
    if(tfSlot<0)
      {
       string tag = "ST_"+(string)pv[h2].time;
@@ -1250,10 +1652,20 @@ void DetectRisingWedge(const MqlRates &rates[], const Pivot &pv[], bool draw, in
    double sH = Slope(pv[h1].price,pv[h2].price,pv[h2].idx-pv[h1].idx);
    double sL = Slope(pv[l1].price,pv[l2].price,pv[l2].idx-pv[l1].idx);
    if(sL <= sH) return;
-   datetime t1 = MathMin(pv[h1].time,pv[l1].time);
-   datetime t2 = MathMax(pv[h2].time,pv[l2].time);
+
+   int hT = CountTouches(pv, pv[h1].idx, pv[h1].price, pv[h2].idx, pv[h2].price, true);
+   int lT = CountTouches(pv, pv[l1].idx, pv[l1].price, pv[l2].idx, pv[l2].price, false);
+   if(MathMax(hT,lT) < InpMinTouches || MathMin(hT,lT) < 2) return;
+
+   datetime t1 = DTMin(pv[h1].time,pv[l1].time);
+   datetime t2 = DTMax(pv[h2].time,pv[l2].time);
+   double height = pv[h2].price - pv[l1].price;
+   int trend = PriorTrend(rates, pv[l1].idx, 30);
+   int score = ComputeScore(trend > 0 ? 1 : 0, 0.0,
+                            (g_curATR > 0) ? height/g_curATR : 1.0,
+                            hT + lT);
    EmphasizeBox("Rising Wedge", t1, t2, pv[h2].price, pv[l1].price,
-                InpBearColor, false, tfSlot);
+                InpBearColor, false, tfSlot, score);
   }
 void DetectFallingWedge(const MqlRates &rates[], const Pivot &pv[], bool draw, int tfSlot)
   {
@@ -1272,35 +1684,60 @@ void DetectFallingWedge(const MqlRates &rates[], const Pivot &pv[], bool draw, i
    double sH = Slope(pv[h1].price,pv[h2].price,pv[h2].idx-pv[h1].idx);
    double sL = Slope(pv[l1].price,pv[l2].price,pv[l2].idx-pv[l1].idx);
    if(sH >= sL) return;
-   datetime t1 = MathMin(pv[h1].time,pv[l1].time);
-   datetime t2 = MathMax(pv[h2].time,pv[l2].time);
+
+   int hT = CountTouches(pv, pv[h1].idx, pv[h1].price, pv[h2].idx, pv[h2].price, true);
+   int lT = CountTouches(pv, pv[l1].idx, pv[l1].price, pv[l2].idx, pv[l2].price, false);
+   if(MathMax(hT,lT) < InpMinTouches || MathMin(hT,lT) < 2) return;
+
+   datetime t1 = DTMin(pv[h1].time,pv[l1].time);
+   datetime t2 = DTMax(pv[h2].time,pv[l2].time);
+   double height = pv[h1].price - pv[l2].price;
+   int trend = PriorTrend(rates, pv[h1].idx, 30);
+   int score = ComputeScore(trend < 0 ? 1 : 0, 0.0,
+                            (g_curATR > 0) ? height/g_curATR : 1.0,
+                            hT + lT);
    EmphasizeBox("Falling Wedge", t1, t2, pv[h1].price, pv[l2].price,
-                InpBullColor, true, tfSlot);
+                InpBullColor, true, tfSlot, score);
   }
 
-// --- Cup & Handle / Inverse ---
+// --- Cup & Handle / Inverse.
+//     Adaptive sizing: cup span scales with available bars; handle is
+//     ~15% of cup span. Cup depth must be >= InpMinPatternATR x ATR.
+//     Handle retrace must not exceed 50% of cup depth (classical rule).
 void DetectCupHandle(const MqlRates &rates[], const Pivot &pv[], bool draw, int tfSlot)
   {
    int n = ArraySize(rates);
-   int span = 50;
-   if(n < span+5) return;
+   int span = MathMin(80, n - 10);
+   if(span < 25) return;
    int end = n-2;
-   int handleStart = end - 7;
+   int handleLen = MathMax(5, span/7);
+   int handleStart = end - handleLen;
    int cupEnd = handleStart;
-   int cupStart = cupEnd - span + 7;
+   int cupStart = cupEnd - (span - handleLen);
    if(cupStart < 0) return;
+
    double leftRim  = rates[cupStart].high;
    double rightRim = rates[cupEnd].high;
    if(!Equalish(leftRim, rightRim)) return;
-   double trough = rates[cupStart].low; int trIdx = cupStart;
-   for(int i=cupStart;i<=cupEnd;i++) if(rates[i].low < trough){ trough=rates[i].low; trIdx=i; }
-   double depth = (leftRim - trough)/leftRim*100.0;
-   if(depth < 1.0) return;
-   // handle: small downward drift below rim
+
+   double trough = rates[cupStart].low;
+   for(int i=cupStart;i<=cupEnd;i++) if(rates[i].low < trough) trough = rates[i].low;
+   double depth = leftRim - trough;
+   if(leftRim > 0 && depth/leftRim*100.0 < 1.0) return;
+   if(g_curATR > 0 && depth < InpMinPatternATR * g_curATR) return;
+
+   // Handle constraints: stays below rim, above trough, and retraces
+   // no more than ~50% of cup depth.
    double hMin=1e18, hMax=-1;
-   for(int i=handleStart;i<=end;i++){ if(rates[i].low<hMin) hMin=rates[i].low; if(rates[i].high>hMax) hMax=rates[i].high; }
+   for(int i=handleStart;i<=end;i++)
+     {
+      if(rates[i].low<hMin) hMin=rates[i].low;
+      if(rates[i].high>hMax) hMax=rates[i].high;
+     }
    if(hMax > leftRim) return;
    if(hMin < trough)  return;
+   if(rightRim - hMin > 0.5 * depth) return;
+
    EmphasizeBox("Cup&Handle", rates[cupStart].time, rates[end].time,
                 MathMax(leftRim,rightRim), trough,
                 InpBullColor, true, tfSlot);
@@ -1309,24 +1746,35 @@ void DetectCupHandle(const MqlRates &rates[], const Pivot &pv[], bool draw, int 
 void DetectInverseCupHandle(const MqlRates &rates[], const Pivot &pv[], bool draw, int tfSlot)
   {
    int n = ArraySize(rates);
-   int span = 50;
-   if(n < span+5) return;
+   int span = MathMin(80, n - 10);
+   if(span < 25) return;
    int end = n-2;
-   int handleStart = end - 7;
+   int handleLen = MathMax(5, span/7);
+   int handleStart = end - handleLen;
    int cupEnd = handleStart;
-   int cupStart = cupEnd - span + 7;
+   int cupStart = cupEnd - (span - handleLen);
    if(cupStart < 0) return;
+
    double leftRim  = rates[cupStart].low;
    double rightRim = rates[cupEnd].low;
    if(!Equalish(leftRim, rightRim)) return;
-   double peak = rates[cupStart].high; int pkIdx = cupStart;
-   for(int i=cupStart;i<=cupEnd;i++) if(rates[i].high > peak){ peak=rates[i].high; pkIdx=i; }
-   double height = (peak - leftRim)/leftRim*100.0;
-   if(height < 1.0) return;
+
+   double peak = rates[cupStart].high;
+   for(int i=cupStart;i<=cupEnd;i++) if(rates[i].high > peak) peak = rates[i].high;
+   double height = peak - leftRim;
+   if(leftRim > 0 && height/leftRim*100.0 < 1.0) return;
+   if(g_curATR > 0 && height < InpMinPatternATR * g_curATR) return;
+
    double hMin=1e18, hMax=-1;
-   for(int i=handleStart;i<=end;i++){ if(rates[i].low<hMin) hMin=rates[i].low; if(rates[i].high>hMax) hMax=rates[i].high; }
+   for(int i=handleStart;i<=end;i++)
+     {
+      if(rates[i].low<hMin) hMin=rates[i].low;
+      if(rates[i].high>hMax) hMax=rates[i].high;
+     }
    if(hMin < leftRim) return;
    if(hMax > peak)    return;
+   if(hMax - rightRim > 0.5 * height) return;
+
    EmphasizeBox("Inv Cup&Handle", rates[cupStart].time, rates[end].time,
                 peak, MathMin(leftRim,rightRim),
                 InpBearColor, false, tfSlot);
@@ -1335,199 +1783,222 @@ void DetectInverseCupHandle(const MqlRates &rates[], const Pivot &pv[], bool dra
 //==================================================================
 // CANDLESTICK PATTERNS (last few bars)
 //==================================================================
+// Helper: trend gate. Returns true when the prior trend matches what
+// the candlestick pattern needs. If InpRequireTrend is off, always true.
+bool TrendOK(const MqlRates &rates[], int idx, int wantDir)
+  {
+   if(!InpRequireTrend) return true;
+   int dir = PriorTrend(rates, idx-1, 20);
+   return (wantDir > 0) ? (dir > 0) : (dir < 0);
+  }
+
 void DetectCandlestickPatterns(const MqlRates &rates[], bool draw, int tfSlot)
   {
    int n = ArraySize(rates);
    if(n < 5) return;
    int last = n-2; // last closed bar
 
-   // --- Engulfing ---
+   // --- Engulfing (strict: second body must STRICTLY exceed first) ---
    if(InpEngulfing)
      {
-      double o1=rates[last-1].open,c1=rates[last-1].close;
-      double o2=rates[last].open,c2=rates[last].close;
-      bool bullEng = (c1<o1) && (c2>o2) && (o2<=c1) && (c2>=o1);
-      bool bearEng = (c1>o1) && (c2<o2) && (o2>=c1) && (c2<=o1);
+      double o1=rates[last-1].open, c1=rates[last-1].close;
+      double o2=rates[last].open,   c2=rates[last].close;
+      bool bullEng = (c1<o1) && (c2>o2) && (o2 < c1) && (c2 > o1) && TrendOK(rates,last,-1);
+      bool bearEng = (c1>o1) && (c2<o2) && (o2 > c1) && (c2 < o1) && TrendOK(rates,last,+1);
       if(bullEng)
-        {
          EmphasizeBox("Engulfing", rates[last-1].time, rates[last].time,
                       MathMax(rates[last-1].high,rates[last].high),
                       MathMin(rates[last-1].low,rates[last].low),
                       InpBullColor, true, tfSlot);
-        }
       else if(bearEng)
-        {
          EmphasizeBox("Engulfing", rates[last-1].time, rates[last].time,
                       MathMax(rates[last-1].high,rates[last].high),
                       MathMin(rates[last-1].low,rates[last].low),
                       InpBearColor, false, tfSlot);
-        }
      }
 
-   // --- Hammer ---
+   // --- Hammer (bullish reversal; needs prior downtrend) ---
    if(InpHammer)
      {
       double body = MathAbs(rates[last].close - rates[last].open);
       double range = rates[last].high - rates[last].low;
       double lowerWick = MathMin(rates[last].open,rates[last].close) - rates[last].low;
       double upperWick = rates[last].high - MathMax(rates[last].open,rates[last].close);
-      if(range>0 && body/range < 0.35 && lowerWick > body*2 && upperWick < body)
-        {
+      if(range>0 && body/range < 0.35 && lowerWick > body*2 && upperWick < body
+         && TrendOK(rates,last,-1))
          EmphasizeBox("Hammer", rates[last].time, rates[last].time,
                       rates[last].high, rates[last].low,
                       InpBullColor, true, tfSlot);
-        }
      }
 
-   // --- Shooting Star ---
+   // --- Shooting Star (bearish reversal; needs prior uptrend) ---
    if(InpShootingStar)
      {
       double body = MathAbs(rates[last].close - rates[last].open);
       double range = rates[last].high - rates[last].low;
       double upperWick = rates[last].high - MathMax(rates[last].open,rates[last].close);
       double lowerWick = MathMin(rates[last].open,rates[last].close) - rates[last].low;
-      if(range>0 && body/range < 0.35 && upperWick > body*2 && lowerWick < body)
-        {
+      if(range>0 && body/range < 0.35 && upperWick > body*2 && lowerWick < body
+         && TrendOK(rates,last,+1))
          EmphasizeBox("Shooting Star", rates[last].time, rates[last].time,
                       rates[last].high, rates[last].low,
                       InpBearColor, false, tfSlot);
-        }
      }
 
-   // --- Doji ---
+   // --- Doji (indecision; trend-agnostic so no gate) ---
    if(InpDoji)
      {
       double body = MathAbs(rates[last].close - rates[last].open);
       double range = rates[last].high - rates[last].low;
       if(range > 0 && body/range < 0.08)
-        {
          EmphasizeBox("Doji", rates[last].time, rates[last].time,
                       rates[last].high, rates[last].low,
                       InpNeutralColor, true, tfSlot);
-        }
      }
 
-   // --- Morning / Evening Star ---
+   // --- Morning / Evening Star (3-bar reversal) ---
    if(n >= 5)
      {
       double o1=rates[last-2].open,c1=rates[last-2].close;
       double o2=rates[last-1].open,c2=rates[last-1].close;
       double o3=rates[last].open,  c3=rates[last].close;
       double mid = (o1+c1)/2.0;
-      if(InpMorningStar && c1<o1 && MathAbs(c2-o2) < MathAbs(c1-o1)*0.4 && c3>o3 && c3>mid)
-        {
+      if(InpMorningStar
+         && c1<o1 && MathAbs(c2-o2) < MathAbs(c1-o1)*0.4 && c3>o3 && c3>mid
+         && TrendOK(rates,last-2,-1))
          EmphasizeBox("Morning Star", rates[last-2].time, rates[last].time,
                       MathMax(rates[last-2].high,rates[last].high),
                       MathMin(rates[last-2].low,rates[last].low),
                       InpBullColor, true, tfSlot);
-        }
-      if(InpEveningStar && c1>o1 && MathAbs(c2-o2) < MathAbs(c1-o1)*0.4 && c3<o3 && c3<mid)
-        {
+      if(InpEveningStar
+         && c1>o1 && MathAbs(c2-o2) < MathAbs(c1-o1)*0.4 && c3<o3 && c3<mid
+         && TrendOK(rates,last-2,+1))
          EmphasizeBox("Evening Star", rates[last-2].time, rates[last].time,
                       MathMax(rates[last-2].high,rates[last].high),
                       MathMin(rates[last-2].low,rates[last].low),
                       InpBearColor, false, tfSlot);
-        }
      }
 
-   // --- Three Soldiers / Three Crows ---
+   // --- Three Soldiers / Three Crows (require similar bodies, small upper/lower wicks) ---
    if(n >= 5)
      {
       if(InpThreeSoldiers)
         {
          bool ok = true;
+         double bodies[3];
          for(int k=last-2;k<=last;k++)
-            if(rates[k].close <= rates[k].open){ ok=false; break; }
-         if(ok && rates[last].close > rates[last-1].close
-               && rates[last-1].close > rates[last-2].close)
            {
+            if(rates[k].close <= rates[k].open){ ok=false; break; }
+            bodies[k-(last-2)] = rates[k].close - rates[k].open;
+           }
+         if(ok)
+           {
+            // upper wicks small (< 30% of body)
+            for(int k=last-2;k<=last;k++)
+              {
+               double uw = rates[k].high - rates[k].close;
+               if(uw > (rates[k].close - rates[k].open) * 0.3) { ok=false; break; }
+              }
+           }
+         // bodies of similar size (smallest >= 50% of largest)
+         double bMax = MathMax(bodies[0], MathMax(bodies[1], bodies[2]));
+         double bMin = MathMin(bodies[0], MathMin(bodies[1], bodies[2]));
+         if(bMax > 0 && bMin / bMax < 0.5) ok = false;
+         if(ok && rates[last].close > rates[last-1].close
+               && rates[last-1].close > rates[last-2].close
+               && TrendOK(rates,last-2,-1))
             EmphasizeBox("Three Soldiers", rates[last-2].time, rates[last].time,
                          rates[last].high, rates[last-2].low,
                          InpBullColor, true, tfSlot);
-           }
         }
       if(InpThreeCrows)
         {
          bool ok = true;
+         double bodies[3];
          for(int k=last-2;k<=last;k++)
-            if(rates[k].close >= rates[k].open){ ok=false; break; }
-         if(ok && rates[last].close < rates[last-1].close
-               && rates[last-1].close < rates[last-2].close)
            {
+            if(rates[k].close >= rates[k].open){ ok=false; break; }
+            bodies[k-(last-2)] = rates[k].open - rates[k].close;
+           }
+         if(ok)
+           {
+            for(int k=last-2;k<=last;k++)
+              {
+               double lw = rates[k].close - rates[k].low;
+               if(lw > (rates[k].open - rates[k].close) * 0.3) { ok=false; break; }
+              }
+           }
+         double bMax = MathMax(bodies[0], MathMax(bodies[1], bodies[2]));
+         double bMin = MathMin(bodies[0], MathMin(bodies[1], bodies[2]));
+         if(bMax > 0 && bMin / bMax < 0.5) ok = false;
+         if(ok && rates[last].close < rates[last-1].close
+               && rates[last-1].close < rates[last-2].close
+               && TrendOK(rates,last-2,+1))
             EmphasizeBox("Three Crows", rates[last-2].time, rates[last].time,
                          rates[last-2].high, rates[last].low,
                          InpBearColor, false, tfSlot);
-           }
         }
      }
 
-   // --- Tweezer Top/Bottom ---
+   // --- Tweezer Top/Bottom (2-bar reversal; needs prior trend) ---
    if(InpTweezer && n >= 3)
      {
       if(Equalish(rates[last].high, rates[last-1].high) &&
-         rates[last-1].close > rates[last-1].open && rates[last].close < rates[last].open)
-        {
+         rates[last-1].close > rates[last-1].open && rates[last].close < rates[last].open
+         && TrendOK(rates,last-1,+1))
          EmphasizeBox("Tweezer Top", rates[last-1].time, rates[last].time,
                       rates[last].high,
                       MathMin(rates[last-1].low,rates[last].low),
                       InpBearColor, false, tfSlot);
-        }
       if(Equalish(rates[last].low, rates[last-1].low) &&
-         rates[last-1].close < rates[last-1].open && rates[last].close > rates[last].open)
-        {
+         rates[last-1].close < rates[last-1].open && rates[last].close > rates[last].open
+         && TrendOK(rates,last-1,-1))
          EmphasizeBox("Tweezer Bottom", rates[last-1].time, rates[last].time,
                       MathMax(rates[last-1].high,rates[last].high),
                       rates[last].low, InpBullColor, true, tfSlot);
-        }
      }
 
-   // --- Piercing Line ---
+   // --- Piercing Line (bullish reversal; needs prior downtrend) ---
    if(InpPiercing && n >= 3)
      {
       double o1=rates[last-1].open,c1=rates[last-1].close;
       double o2=rates[last].open,  c2=rates[last].close;
       double mid = (o1+c1)/2.0;
-      if(c1<o1 && o2<c1 && c2>mid && c2<o1)
-        {
+      if(c1<o1 && o2<c1 && c2>mid && c2<o1 && TrendOK(rates,last-1,-1))
          EmphasizeBox("Piercing Line", rates[last-1].time, rates[last].time,
                       MathMax(rates[last-1].high,rates[last].high),
                       MathMin(rates[last-1].low,rates[last].low),
                       InpBullColor, true, tfSlot);
-        }
      }
 
-   // --- Dark Cloud Cover ---
+   // --- Dark Cloud Cover (bearish reversal; needs prior uptrend) ---
    if(InpDarkCloud && n >= 3)
      {
       double o1=rates[last-1].open,c1=rates[last-1].close;
       double o2=rates[last].open,  c2=rates[last].close;
       double mid = (o1+c1)/2.0;
-      if(c1>o1 && o2>c1 && c2<mid && c2>o1)
-        {
+      if(c1>o1 && o2>c1 && c2<mid && c2>o1 && TrendOK(rates,last-1,+1))
          EmphasizeBox("Dark Cloud Cover", rates[last-1].time, rates[last].time,
                       MathMax(rates[last-1].high,rates[last].high),
                       MathMin(rates[last-1].low,rates[last].low),
                       InpBearColor, false, tfSlot);
-        }
      }
   }
 
 //==================================================================
 // ALERT
 //==================================================================
-void FireAlert(string name, bool bullish)
+void FireAlert(string name, bool bullish, int score)
   {
-   string tag = _Symbol+"_"+name+"_"+(string)(int)Period();
-   if(tag == g_lastAlertTag && TimeCurrent() - g_lastAlertTime < 60) return;
-   g_lastAlertTag = tag;
-   g_lastAlertTime = TimeCurrent();
+   string key = _Symbol+"_"+(string)(int)_Period+"_"+name;
+   if(!ShouldAlert(key, 60)) return;
    string display = LocalizedPatternName(name);
    string dir     = DirectionLabel(bullish);
    string msg = (InpLanguage == LANG_JA)
-                ? StringFormat("[PatternScope] %s シグナル: %s (%s / %s)",
-                               dir, display, _Symbol, TFShort(_Period))
-                : StringFormat("[PatternScope] %s signal: %s (%s / %s)",
-                               dir, display, _Symbol, TFShort(_Period));
+                ? StringFormat("[PatternScope] %s シグナル: %s スコア%d (%s / %s)",
+                               dir, display, score, _Symbol, TFShort(_Period))
+                : StringFormat("[PatternScope] %s signal: %s score=%d (%s / %s)",
+                               dir, display, score, _Symbol, TFShort(_Period));
    if(InpAlertPopup) Alert(msg);
    if(InpAlertSound) PlaySound(InpAlertSoundFile);
    if(InpAlertPush)  SendNotification(msg);
@@ -1541,7 +2012,7 @@ void BuildDashboardSkeleton()
    string bg = PS_DASH+"BG";
    if(ObjectFind(0,bg) < 0) ObjectCreate(0,bg,OBJ_RECTANGLE_LABEL,0,0,0);
    int patN = ArraySize(g_patternNames);
-   int w = 230 + 56*g_tfCount;
+   int w = 230 + 68*g_tfCount;
    int h = 26 + 14*patN + 10;
    ObjectSetInteger(0,bg,OBJPROP_CORNER,CORNER_LEFT_UPPER);
    ObjectSetInteger(0,bg,OBJPROP_XDISTANCE,InpDashX);
@@ -1567,7 +2038,7 @@ void BuildDashboardSkeleton()
      {
       CreateLabel(PS_DASH+"H_TF"+(string)i,
                   TFShort(g_tfStatus[i].tf),
-                  InpDashX+230+56*i, InpDashY+24, InpDashHeader, InpDashFontSize);
+                  InpDashX+230+68*i, InpDashY+24, InpDashHeader, InpDashFontSize);
      }
 
    // Rows
@@ -1578,7 +2049,7 @@ void BuildDashboardSkeleton()
       for(int t=0;t<g_tfCount;t++)
         {
          CreateLabel(PS_DASH+"C"+(string)p+"_"+(string)t, "-",
-                     InpDashX+230+56*t, InpDashY+40+14*p,
+                     InpDashX+230+68*t, InpDashY+40+14*p,
                      InpDashText, InpDashFontSize);
         }
      }
@@ -1611,7 +2082,7 @@ string TFShort(ENUM_TIMEFRAMES tf)
       case PERIOD_D1:  return "D1";
       case PERIOD_W1:  return "W1";
       case PERIOD_MN1: return "MN";
-      default:         return EnumToString(tf);
+      default:         return "?";  // unknown TF — avoid overflowing dashboard column
      }
   }
 
@@ -1626,7 +2097,8 @@ void UpdateDashboard()
          color  clr = InpDashText;
          if(g_tfStatus[t].active[p])
            {
-            txt = DirectionLabel(g_tfStatus[t].bullish[p]);
+            int sc = g_tfStatus[t].score[p];
+            txt = DirectionLabel(g_tfStatus[t].bullish[p]) + " " + (string)sc;
             clr = g_tfStatus[t].bullish[p] ? InpBullColor : InpBearColor;
            }
          ObjectSetString (0,name,OBJPROP_TEXT,txt);
