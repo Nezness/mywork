@@ -2,20 +2,37 @@
 //|                                                 PatternScope.mq5 |
 //|                                  Classic Chart Pattern Scanner   |
 //|                          Reversal / Continuation / Candlestick   |
+//|                                                                  |
+//|  Public portfolio sample. No credentials or proprietary data.    |
+//|  Source encoding: UTF-8 (no BOM).                                |
+//|  If JP characters appear garbled in MetaEditor, re-save as       |
+//|  UTF-8 with BOM (File > Save As ... > Encoding).                 |
 //+------------------------------------------------------------------+
 #property copyright   "PatternScope"
 #property link        ""
-#property version     "1.00"
-#property description "Detects classic chart and candlestick patterns,"
-#property description "highlights them on the chart with labels,"
-#property description "and shows a multi-timeframe dashboard panel."
+#property version     "1.10"
+#property description "Classic chart & candlestick pattern scanner."
+#property description "Highlights formations and shows an MTF dashboard."
+#property description "Bilingual UI (Japanese / English) via Language input."
 #property strict
 #property indicator_chart_window
 #property indicator_plots 0
 
 //==================================================================
+// LANGUAGE ENUM
+//==================================================================
+enum ENUM_PS_LANG
+  {
+   LANG_JA = 0,   // 日本語
+   LANG_EN = 1    // English
+  };
+
+//==================================================================
 // INPUTS
 //==================================================================
+input group "=== Language / 表示言語 ==="
+input ENUM_PS_LANG InpLanguage = LANG_JA;   // UI language (JP / EN)
+
 input group "=== Pivot / Swing Detection ==="
 input int    InpPivotLeft        = 5;        // Bars left of pivot
 input int    InpPivotRight       = 5;        // Bars right of pivot
@@ -106,7 +123,8 @@ input string InpAlertSoundFile   = "alert.wav";
 #define PS_DASH    "PSD_"
 #define MAX_PATTERNS 32
 
-// Pattern catalog (used for dashboard rows)
+// Pattern catalog — internal English IDs (used as map keys).
+// Display text is resolved at render time via LocalizedPatternName().
 const string g_patternNames[] = {
    "Double Top","Double Bottom","Triple Top","Triple Bottom",
    "Head&Shoulders","Inverse H&S","Rounding Top","Rounding Bottom",
@@ -118,6 +136,64 @@ const string g_patternNames[] = {
    "Engulfing","Hammer","Shooting Star","Doji",
    "Morning Star","Evening Star"
 };
+
+//==================================================================
+// LOCALIZATION
+//==================================================================
+string Tr(string ja, string en)
+  {
+   return (InpLanguage == LANG_JA) ? ja : en;
+  }
+
+string LocalizedPatternName(string id)
+  {
+   if(InpLanguage == LANG_EN) return id;
+   if(id == "Double Top")        return "ダブルトップ";
+   if(id == "Double Bottom")     return "ダブルボトム";
+   if(id == "Triple Top")        return "トリプルトップ";
+   if(id == "Triple Bottom")     return "トリプルボトム";
+   if(id == "Head&Shoulders")    return "ヘッド&ショルダー";
+   if(id == "Inverse H&S")       return "逆ヘッド&ショルダー";
+   if(id == "Rounding Top")      return "ラウンディングトップ";
+   if(id == "Rounding Bottom")   return "ラウンディングボトム";
+   if(id == "V-Top")             return "V字トップ";
+   if(id == "V-Bottom")          return "V字ボトム";
+   if(id == "Diamond Top")       return "ダイヤモンドトップ";
+   if(id == "Diamond Bottom")    return "ダイヤモンドボトム";
+   if(id == "Broadening Top")    return "ブロードニングトップ";
+   if(id == "Broadening Bottom") return "ブロードニングボトム";
+   if(id == "Bull Flag")         return "上昇フラッグ";
+   if(id == "Bear Flag")         return "下降フラッグ";
+   if(id == "Bull Pennant")      return "上昇ペナント";
+   if(id == "Bear Pennant")      return "下降ペナント";
+   if(id == "Rectangle")         return "レクタングル";
+   if(id == "Asc Triangle")      return "上昇トライアングル";
+   if(id == "Desc Triangle")     return "下降トライアングル";
+   if(id == "Sym Triangle")      return "対称トライアングル";
+   if(id == "Rising Wedge")      return "ライジングウェッジ";
+   if(id == "Falling Wedge")     return "フォーリングウェッジ";
+   if(id == "Cup&Handle")        return "カップ&ハンドル";
+   if(id == "Inv Cup&Handle")    return "逆カップ&ハンドル";
+   if(id == "Engulfing")         return "包み線";
+   if(id == "Hammer")            return "ハンマー";
+   if(id == "Shooting Star")     return "シューティングスター";
+   if(id == "Doji")              return "ドージ(同事)";
+   if(id == "Morning Star")      return "明けの明星";
+   if(id == "Evening Star")      return "宵の明星";
+   if(id == "Three Soldiers")    return "赤三兵";
+   if(id == "Three Crows")       return "三羽烏";
+   if(id == "Tweezer Top")       return "毛抜きトップ";
+   if(id == "Tweezer Bottom")    return "毛抜きボトム";
+   if(id == "Piercing Line")     return "切り込み線";
+   if(id == "Dark Cloud Cover")  return "かぶせ線";
+   return id;
+  }
+
+string DirectionLabel(bool bullish)
+  {
+   if(InpLanguage == LANG_JA) return bullish ? "買い" : "売り";
+   return bullish ? "BUY" : "SELL";
+  }
 
 //==================================================================
 // STRUCTURES
@@ -517,7 +593,8 @@ void DrawArrow(string tag, datetime t, double price, bool up, color clr)
    ObjectSetInteger(0,name,OBJPROP_HIDDEN,true);
   }
 
-// Generic helper that draws box + label + (optional) lines for a pattern
+// Generic helper that draws box + label + (optional) lines for a pattern.
+// `name` is the internal English ID; UI strings are localized inside.
 void EmphasizeBox(string name, datetime t1, datetime t2, double pHigh, double pLow,
                   color clr, bool bullish, int tfSlot)
   {
@@ -525,8 +602,9 @@ void EmphasizeBox(string name, datetime t1, datetime t2, double pHigh, double pL
    if(tfSlot >= 0) return;
    string tag = name + "_" + (string)t1;
    StringReplace(tag," ","_");
+   StringReplace(tag,"&","_");
    DrawBox(tag,t1,pHigh,t2,pLow,clr);
-   DrawLabel(tag+"_lbl", t2, pHigh, name, clr, true);
+   DrawLabel(tag+"_lbl", t2, pHigh, LocalizedPatternName(name), clr, true);
    FireAlert(name,bullish);
   }
 
@@ -1439,13 +1517,17 @@ void DetectCandlestickPatterns(const MqlRates &rates[], bool draw, int tfSlot)
 //==================================================================
 void FireAlert(string name, bool bullish)
   {
-   string dir = bullish ? "BUY" : "SELL";
    string tag = _Symbol+"_"+name+"_"+(string)(int)Period();
    if(tag == g_lastAlertTag && TimeCurrent() - g_lastAlertTime < 60) return;
    g_lastAlertTag = tag;
    g_lastAlertTime = TimeCurrent();
-   string msg = StringFormat("[PatternScope] %s %s (%s/%s)",
-                             dir, name, _Symbol, EnumToString(_Period));
+   string display = LocalizedPatternName(name);
+   string dir     = DirectionLabel(bullish);
+   string msg = (InpLanguage == LANG_JA)
+                ? StringFormat("[PatternScope] %s シグナル: %s (%s / %s)",
+                               dir, display, _Symbol, TFShort(_Period))
+                : StringFormat("[PatternScope] %s signal: %s (%s / %s)",
+                               dir, display, _Symbol, TFShort(_Period));
    if(InpAlertPopup) Alert(msg);
    if(InpAlertSound) PlaySound(InpAlertSoundFile);
    if(InpAlertPush)  SendNotification(msg);
@@ -1474,11 +1556,12 @@ void BuildDashboardSkeleton()
    ObjectSetInteger(0,bg,OBJPROP_HIDDEN,true);
 
    // Title
-   CreateLabel(PS_DASH+"TITLE","PatternScope MTF",
+   CreateLabel(PS_DASH+"TITLE",
+               Tr("PatternScope MTF パターン検出","PatternScope MTF Scanner"),
                InpDashX+10, InpDashY+6, InpDashHeader, InpDashFontSize+1);
 
    // Header: pattern column + TF columns
-   CreateLabel(PS_DASH+"H_PATTERN","Pattern",
+   CreateLabel(PS_DASH+"H_PATTERN", Tr("パターン","Pattern"),
                InpDashX+10, InpDashY+24, InpDashHeader, InpDashFontSize);
    for(int i=0;i<g_tfCount;i++)
      {
@@ -1490,7 +1573,7 @@ void BuildDashboardSkeleton()
    // Rows
    for(int p=0;p<ArraySize(g_patternNames);p++)
      {
-      CreateLabel(PS_DASH+"P"+(string)p, g_patternNames[p],
+      CreateLabel(PS_DASH+"P"+(string)p, LocalizedPatternName(g_patternNames[p]),
                   InpDashX+10, InpDashY+40+14*p, InpDashText, InpDashFontSize);
       for(int t=0;t<g_tfCount;t++)
         {
@@ -1543,7 +1626,7 @@ void UpdateDashboard()
          color  clr = InpDashText;
          if(g_tfStatus[t].active[p])
            {
-            txt = g_tfStatus[t].bullish[p] ? "BUY" : "SELL";
+            txt = DirectionLabel(g_tfStatus[t].bullish[p]);
             clr = g_tfStatus[t].bullish[p] ? InpBullColor : InpBearColor;
            }
          ObjectSetString (0,name,OBJPROP_TEXT,txt);
